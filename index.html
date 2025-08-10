@@ -1,31 +1,189 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Download Text File for Testing</title>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WebRTC P2P with QR Codes</title>
+<style>
+  #qrCodeCanvas, #video { width: 300px; height: 300px; border: 1px solid black; }
+</style>
 </head>
 <body>
-  <h1>Download Text File for Testing</h1>
-  <button onclick="downloadFile()">Download</button>
 
-  <script>
-    function downloadFile() {
-      const text = 'testing settings';
-      const blob = new Blob([text], { type: 'text/plain' });
-      const link = document.createElement('a');
+<h2>Create Offer (Host)</h2>
+<button id="createOffer">Create Offer & Show QR</button>
+<canvas id="qrCodeCanvas"></canvas>
 
-      // File name with spaces
-      link.download = 'testing_settings.txt';
-      link.href = URL.createObjectURL(blob);
+<h2>Scan Answer (Joiner)</h2>
+<video id="video" autoplay></video>
+<button id="startScan">Start Camera & Scan QR</button>
 
-      // Trigger download
-      document.body.appendChild(link);
-      link.click();
+<h2>Status</h2>
+<pre id="status"></pre>
 
-      // Cleanup
-      document.body.removeChild(link);
-      URL.revokeObjectURL(link.href);
+<script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr/dist/jsQR.js"></script>
+
+<script>
+  let pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+  let dataChannel;
+  const qrCanvas = document.getElementById("qrCodeCanvas");
+  const video = document.getElementById("video");
+  const status = document.getElementById("status");
+
+  // Utility to update status text
+  function log(msg) {
+    status.textContent += msg + "\n";
+    status.scrollTop = status.scrollHeight;
+  }
+
+  // Create offer, show QR with SDP
+  async function createOfferQR() {
+    dataChannel = pc.createDataChannel("game");
+    setupDataChannel();
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log("Created offer");
+
+    // Wait for ICE gathering
+    await new Promise((res) => {
+      if (pc.iceGatheringState === "complete") res();
+      else {
+        function check() {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", check);
+            res();
+          }
+        }
+        pc.addEventListener("icegatheringstatechange", check);
+      }
+    });
+
+    // Encode SDP as base64 to reduce QR complexity
+    const sdpBase64 = btoa(pc.localDescription.sdp);
+
+    // Generate QR code for SDP offer
+    QRCode.toCanvas(qrCanvas, sdpBase64, { width: 300 }, function (error) {
+      if (error) console.error(error);
+      else log("Offer QR code generated");
+    });
+  }
+
+  // Setup data channel event handlers
+  function setupDataChannel() {
+    dataChannel.onopen = () => log("Data channel opened");
+    dataChannel.onmessage = (e) => log("Received: " + e.data);
+  }
+
+  // Scan QR from video, decode SDP answer, set remote description
+  async function startScanAnswer() {
+    log("Starting camera for scanning...");
+
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    video.srcObject = stream;
+
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+
+    function scanFrame() {
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height);
+        if (code) {
+          log("QR code detected!");
+          // Stop camera
+          stream.getTracks().forEach((t) => t.stop());
+          video.srcObject = null;
+
+          // Decode SDP answer
+          const sdpAnswer = atob(code.data);
+          handleAnswerSDP(sdpAnswer);
+          return;
+        }
+      }
+      requestAnimationFrame(scanFrame);
     }
-  </script>
+    scanFrame();
+  }
+
+  // Handle remote SDP answer from joiner
+  async function handleAnswerSDP(sdp) {
+    log("Received SDP answer");
+    await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp }));
+    log("Connection established, waiting for data channel...");
+  }
+
+  // Called by joiner to receive offer via scanning QR from host (simplified here)
+  async function joinByScanningOffer(offerSDPBase64) {
+    const offerSDP = atob(offerSDPBase64);
+    pc.ondatachannel = (event) => {
+      dataChannel = event.channel;
+      setupDataChannel();
+    };
+    await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: offerSDP }));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // Wait for ICE gathering
+    await new Promise((res) => {
+      if (pc.iceGatheringState === "complete") res();
+      else {
+        function check() {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", check);
+            res();
+          }
+        }
+        pc.addEventListener("icegatheringstatechange", check);
+      }
+    });
+
+    // Generate QR code of answer SDP
+    const answerBase64 = btoa(pc.localDescription.sdp);
+    QRCode.toCanvas(qrCanvas, answerBase64, { width: 300 }, function (error) {
+      if (error) console.error(error);
+      else log("Answer QR code generated, scan this with host!");
+    });
+  }
+
+  // Event listeners for UI buttons
+  document.getElementById("createOffer").onclick = () => {
+    createOfferQR();
+  };
+
+  document.getElementById("startScan").onclick = () => {
+    startScanAnswer();
+  };
+
+  // Example broadcast & onData (extend as needed)
+  function broadcast(data) {
+    if (dataChannel && dataChannel.readyState === "open") {
+      dataChannel.send(data);
+      log("Sent: " + data);
+    } else {
+      log("Data channel not open");
+    }
+  }
+
+  function onData(callback) {
+    if (!dataChannel) return;
+    dataChannel.onmessage = (e) => callback(e.data);
+  }
+
+  // For demo/testing, you might add UI or console commands
+  window.broadcast = broadcast;
+  window.onData = onData;
+  window.joinByScanningOffer = joinByScanningOffer;
+
+  log("Ready. Press 'Create Offer' on host device.");
+</script>
+
 </body>
 </html>
